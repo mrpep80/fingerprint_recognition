@@ -1,16 +1,5 @@
-"""
-pipeline/verifier.py
-=====================
-Verifica geometrica dei match tramite RANSAC + omografia.
-
-Usata solo per i matcher a descrittore (SIFT, ORB, AKAZE).
-MinutiaeMatcher ha già la verifica RANSAC interna → is_verified=True.
-
-L'omografia H (3×3) modella la relazione geometrica tra le due immagini
-ed è invariante a rotazione, scala e prospettiva.
-"""
-
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -23,11 +12,12 @@ from ..extractors.base import FeatureSet
 
 @dataclass
 class VerificationResult:
-    """Risultato della verifica geometrica."""
-    n_inliers:   int
-    homography:  Optional[np.ndarray] = None
+    n_inliers: int
+    homography: Optional[np.ndarray] = None
     inlier_mask: Optional[np.ndarray] = None
-    inlier_matches: List = None          # subset di DMatch, utile al visualizer
+    inlier_matches: List = None
+    geometry_quality: float = 0.0
+    coverage: float = 0.0
 
     def __post_init__(self):
         if self.inlier_matches is None:
@@ -35,67 +25,77 @@ class VerificationResult:
 
 
 class RANSACVerifier:
-    """Verifica geometrica con RANSAC e stima dell'omografia."""
+    """RANSAC con controlli contro match degenerati o troppo concentrati."""
 
     def __init__(self, config):
         self.cfg = config
 
-    def verify(
-        self,
-        query_feat:  FeatureSet,
-        ref_feat:    FeatureSet,
-        match_score: MatchScore,
-    ) -> VerificationResult:
-        """
-        Verifica i match con RANSAC.
-
-        Args:
-            query_feat  : FeatureSet del frammento
-            ref_feat    : FeatureSet del riferimento
-            match_score : MatchScore prodotto dal matcher
-
-        Returns:
-            VerificationResult con numero di inlier e omografia
-        """
-        # Se il matcher ha già verificato internamente (MinutiaeMatcher)
-        if match_score.is_verified:
-            return VerificationResult(
-                n_inliers=match_score.n_good,
-                inlier_matches=match_score.raw_matches,
-            )
-
+    def verify(self, query_feat: FeatureSet, ref_feat: FeatureSet,
+               match_score: MatchScore) -> VerificationResult:
         good = match_score.raw_matches
         if len(good) < self.cfg.min_inliers:
-            return VerificationResult(n_inliers=0)
+            return VerificationResult(0)
 
-        kp_q = query_feat.keypoints
-        kp_r = ref_feat.keypoints
+        if match_score.is_verified:
+            pairs = good
+            if len(pairs) < self.cfg.min_inliers:
+                return VerificationResult(0)
+            qmins = query_feat.metadata.get("minutiae", [])
+            rmins = ref_feat.metadata.get("minutiae", [])
+            if not qmins or not rmins:
+                return VerificationResult(0)
+            q = np.float32([[qmins[a]["x"], qmins[a]["y"]] for a, _ in pairs])
+            r = np.float32([[rmins[b]["x"], rmins[b]["y"]] for _, b in pairs])
+            return self._quality(len(pairs), q, r, None, pairs)
 
-        src = np.float32(
-            [kp_q[m.queryIdx].pt for m in good]
-        ).reshape(-1, 1, 2)
-        dst = np.float32(
-            [kp_r[m.trainIdx].pt for m in good]
-        ).reshape(-1, 1, 2)
-
+        kpq, kpr = query_feat.keypoints, ref_feat.keypoints
+        src = np.float32([kpq[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([kpr[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
         try:
             H, mask = cv2.findHomography(
-                src, dst,
-                cv2.RANSAC,
+                src, dst, cv2.RANSAC,
                 self.cfg.ransac_reprojection_error,
+                maxIters=3000, confidence=0.995,
             )
         except cv2.error:
-            return VerificationResult(n_inliers=0)
-
+            return VerificationResult(0)
         if mask is None:
-            return VerificationResult(n_inliers=0)
+            return VerificationResult(0)
+        idx = np.flatnonzero(mask.ravel())
+        q = src.reshape(-1, 2)[idx]
+        r = dst.reshape(-1, 2)[idx]
+        pairs = [good[i] for i in idx]
+        return self._quality(len(idx), q, r, H, pairs, mask)
 
-        n_inliers      = int(mask.sum())
-        inlier_matches = [good[i] for i, v in enumerate(mask.ravel()) if v]
+    def _quality(self, n, q, r, H, pairs, mask=None):
+        if n < self.cfg.min_inliers:
+            return VerificationResult(0)
+
+        def spread(pts):
+            if len(pts) < 4:
+                return 0.0
+            area = max(float(np.ptp(pts[:, 0]) * np.ptp(pts[:, 1])), 1.0)
+            return float(np.clip(area / self.cfg.geometry_area_reference, 0, 1))
+
+        coverage = min(spread(q), spread(r))
+        count_term = min(1.0, n / self.cfg.geometry_inlier_target)
+        quality = (count_term ** 0.55) * (max(0.25, coverage) ** 0.45)
+
+        if H is not None:
+            A = H[:2, :2]
+            det = abs(float(np.linalg.det(A)))
+            scale = np.sqrt(max(det, 1e-9))
+            if not (self.cfg.homography_min_scale <= scale <= self.cfg.homography_max_scale):
+                quality *= 0.25
+            perspective = max(abs(float(H[2, 0])), abs(float(H[2, 1])))
+            if perspective > self.cfg.homography_max_perspective:
+                quality *= 0.35
 
         return VerificationResult(
-            n_inliers=n_inliers,
+            n_inliers=n,
             homography=H,
             inlier_mask=mask,
-            inlier_matches=inlier_matches,
+            inlier_matches=pairs,
+            geometry_quality=float(np.clip(quality, 0, 1)),
+            coverage=float(coverage),
         )
