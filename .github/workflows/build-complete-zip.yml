@@ -1,0 +1,18 @@
+name: Build complete ZIP
+on:
+  push:
+    branches: [fix/robust-fingerprint-fusion]
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove repository cache files
+        run: find . -type d -name '__pycache__' -prune -exec rm -rf {} + && rm -f .DS_Store
+      - name: Package
+        run: zip -r fingerprint_matcher_v4_complete.zip . -x '.git/*' 'fingerprint_matcher_v4_complete.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fingerprint_matcher_v4_complete
+          path: fingerprint_matcher_v4_complete.zip
+          retention-days: 7
