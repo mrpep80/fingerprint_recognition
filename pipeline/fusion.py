@@ -1,149 +1,96 @@
-"""
-pipeline/fusion.py
-==================
-Fusione dei risultati di più metodi di matching (score-level fusion).
-
-Algoritmo: CombMNZ normalizzato
---------------------------------
-CombMNZ è uno standard in biometria multi-modale (Ho et al., 1994).
-
-  1. Per ogni metodo M:
-       score_norm[i] = (score[i] - min_M) / (max_M - min_M + ε)
-  2. Per ogni immagine i:
-       combMNZ[i] = Σ(score_norm[i][m]) × n_metodi_attivi[i]
-
-Il fattore n_metodi_attivi premia le immagini identificate da più metodi,
-rendendo il risultato più robusto rispetto a qualsiasi metodo singolo.
-
-Vantaggi rispetto all'ensemble weighted-average:
-  - Non richiede pesi pre-impostati
-  - Robusto alle scale diverse tra i metodi
-  - Trasparente: mostra il contributo di ogni metodo
-  - Automaticamente adattivo alla qualità del database
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
+
 import numpy as np
 
 
 @dataclass
 class FusedResult:
-    """Risultato della fusione multi-metodo per una singola scheda."""
-    filename:        str
-    combined_score:  float              # CombMNZ normalizzato [0..100]
-    per_method:      Dict[str, float]   # score di ogni metodo [0..100]
-    best_method:     str                # metodo con score più alto
-    n_active:        int                # quanti metodi hanno trovato un match
-    inliers:         Dict[str, int]     # inliers per metodo
+    filename: str
+    combined_score: float
+    per_method: Dict[str, float]
+    best_method: str
+    n_active: int
+    inliers: Dict[str, int]
+    ranks: Dict[str, int]
+    consensus: float = 0.0
+    matched_finger: str = "n/a"
 
     def __lt__(self, other):
         return self.combined_score < other.combined_score
 
 
 class ScoreFusion:
-    """
-    Fonde i risultati di N metodi di matching in un ranking unico.
+    """Fusion multi-metodo senza min-max sul database.
 
-    Uso:
-        fusion = ScoreFusion(threshold=5.0)
-        fused  = fusion.fuse(results_by_method)
+    Usa score assoluti + percentile/rank + consenso tra metodi. In questo
+    modo un falso positivo che e' semplicemente il migliore del database non
+    diventa automaticamente 100%.
     """
 
-    def __init__(self, threshold: float = 5.0):
-        """
-        Args:
-            threshold: score minimo (0-100) perché un metodo
-                       sia considerato "attivo" per un'immagine.
-                       Sotto questa soglia il metodo non contribuisce al CombMNZ.
-        """
+    def __init__(self, threshold: float = 12.0):
         self.threshold = threshold
 
-    def fuse(
-        self,
-        results_by_method: Dict[str, List],   # { method_name: [MatchResult] }
-        weights: Optional[Dict[str, float]] = None,
-    ) -> List[FusedResult]:
-        """
-        Esegue la fusione CombMNZ e restituisce la lista ordinata.
-
-        Args:
-            results_by_method : dizionario { nome_metodo: lista MatchResult }
-            weights           : pesi opzionali { nome_metodo: peso }.
-                                Se None, tutti i metodi hanno peso uguale.
-        """
+    def fuse(self, results_by_method: Dict[str, List],
+             weights: Optional[Dict[str, float]] = None) -> List[FusedResult]:
         if not results_by_method:
             return []
+        methods = list(results_by_method)
+        weights = weights or {m: 1.0 for m in methods}
+        weights = {m: max(float(weights.get(m, 0.0)), 0.0) for m in methods}
 
-        methods   = list(results_by_method.keys())
-        n_methods = len(methods)
+        files = sorted({r.filename for rs in results_by_method.values() for r in rs})
+        raw = {f: {m: 0.0 for m in methods} for f in files}
+        inl = {f: {m: 0 for m in methods} for f in files}
+        fingers = {f: {} for f in files}
+        for m, rs in results_by_method.items():
+            for r in rs:
+                raw[r.filename][m] = float(r.score)
+                inl[r.filename][m] = int(r.n_inliers)
+                finger = getattr(r, "matched_finger", "n/a")
+                if finger != "n/a":
+                    fingers[r.filename][m] = finger
 
-        # Pesi di default: uniformi
-        if weights is None:
-            weights = {m: 1.0 for m in methods}
-        # Normalizza i pesi in modo che sommino a n_methods
-        total_w = sum(weights.values())
-        weights = {m: w * n_methods / total_w for m, w in weights.items()}
-
-        # Indice filename → risultati per metodo
-        scores_raw:   Dict[str, Dict[str, float]] = {}   # fname → {method → score}
-        inliers_raw:  Dict[str, Dict[str, int]]   = {}   # fname → {method → inliers}
-
-        for method, results in results_by_method.items():
-            for r in results:
-                if r.filename not in scores_raw:
-                    scores_raw[r.filename]  = {}
-                    inliers_raw[r.filename] = {}
-                scores_raw[r.filename][method]  = r.score
-                inliers_raw[r.filename][method] = r.n_inliers
-
-        all_files = list(scores_raw.keys())
-
-        # Min-max normalization per metodo
-        method_scores_all: Dict[str, List[float]] = {
-            m: [scores_raw[f].get(m, 0.0) for f in all_files]
+        ranks = {
+            m: {f: i + 1 for i, f in enumerate(sorted(files, key=lambda x: raw[x][m], reverse=True))}
             for m in methods
         }
-        norms: Dict[str, Dict[str, float]] = {}
-        for m in methods:
-            vals   = method_scores_all[m]
-            lo, hi = min(vals), max(vals)
-            spread = hi - lo if hi > lo else 1.0
-            norms[m] = {
-                f: (scores_raw[f].get(m, 0.0) - lo) / spread
-                for f in all_files
-            }
+        n = len(files)
+        fused = []
 
-        # CombMNZ per ogni file
-        fused: List[FusedResult] = []
-        for fname in all_files:
-            per_method = {m: scores_raw[fname].get(m, 0.0) for m in methods}
-            n_active   = sum(
-                1 for m in methods
-                if per_method.get(m, 0.0) >= self.threshold
-            )
+        for f in files:
+            active = [m for m in methods if raw[f][m] >= self.threshold]
+            if not active:
+                active = [max(methods, key=lambda m: raw[f][m])]
 
-            combmnz = sum(
-                norms[m][fname] * weights.get(m, 1.0)
-                for m in methods
-                if per_method.get(m, 0.0) >= self.threshold
-            ) * max(n_active, 1)
+            parts = []
+            for m in active:
+                percentile = 1.0 - (ranks[m][f] - 1) / max(n - 1, 1)
+                confidence = np.clip(raw[f][m] / 100.0, 0, 1)
+                parts.append((percentile ** 0.55) * (confidence ** 0.45) * weights[m])
 
-            # Normalizza CombMNZ in [0,100]
-            combined = float(np.clip(combmnz / n_methods * 100, 0, 100))
-
-            best_m = max(per_method, key=lambda m: per_method[m]) if per_method else "n/a"
+            denom = sum(weights[m] for m in active) or 1.0
+            base = sum(parts) / denom
+            consensus = len(active) / len(methods)
+            agreement = 0.70 + 0.30 * consensus
+            combined = 100.0 * base * agreement
+            best = max(methods, key=lambda m: raw[f][m])
+            finger = fingers[f].get(best, next(iter(fingers[f].values()), "n/a"))
 
             fused.append(FusedResult(
-                filename=fname,
-                combined_score=combined,
-                per_method=per_method,
-                best_method=best_m,
-                n_active=n_active,
-                inliers={m: inliers_raw[fname].get(m, 0) for m in methods},
+                filename=f,
+                combined_score=float(np.clip(combined, 0, 100)),
+                per_method=raw[f],
+                best_method=best,
+                n_active=len(active),
+                inliers=inl[f],
+                ranks={m: ranks[m][f] for m in methods},
+                consensus=consensus,
+                matched_finger=finger,
             ))
 
-        fused.sort(key=lambda r: r.combined_score, reverse=True)
+        fused.sort(key=lambda r: (r.combined_score, r.n_active,
+                                  max(r.inliers.values())), reverse=True)
         return fused
