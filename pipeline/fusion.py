@@ -23,15 +23,16 @@ class FusedResult:
 
 
 class ScoreFusion:
-    """Fusion multi-metodo senza min-max sul database.
+    """Evidence fusion without database min-max normalization.
 
-    Usa score assoluti + percentile/rank + consenso tra metodi. In questo
-    modo un falso positivo che e' semplicemente il migliore del database non
-    diventa automaticamente 100%.
+    Every available engine contributes independently when it produces positive
+    evidence. Very small scores do not create false consensus: consensus is
+    counted only for scores >= support_threshold. This is important because
+    SIFT/ORB and BOZORTH3 naturally live on different score distributions.
     """
 
-    def __init__(self, threshold: float = 12.0):
-        self.threshold = threshold
+    def __init__(self, support_threshold: float = 5.0):
+        self.support_threshold = support_threshold
 
     def fuse(self, results_by_method: Dict[str, List],
              weights: Optional[Dict[str, float]] = None) -> List[FusedResult]:
@@ -54,43 +55,48 @@ class ScoreFusion:
                     fingers[r.filename][m] = finger
 
         ranks = {
-            m: {f: i + 1 for i, f in enumerate(sorted(files, key=lambda x: raw[x][m], reverse=True))}
+            m: {f: i + 1 for i, f in enumerate(
+                sorted(files, key=lambda x: raw[x][m], reverse=True))}
             for m in methods
         }
         n = len(files)
         fused = []
 
         for f in files:
-            active = [m for m in methods if raw[f][m] >= self.threshold]
-            if not active:
-                active = [max(methods, key=lambda m: raw[f][m])]
+            positive = [m for m in methods if raw[f][m] > 0.0 and weights[m] > 0]
+            if not positive:
+                positive = [max(methods, key=lambda m: raw[f][m])]
 
             parts = []
-            for m in active:
+            for m in positive:
                 percentile = 1.0 - (ranks[m][f] - 1) / max(n - 1, 1)
                 confidence = np.clip(raw[f][m] / 100.0, 0, 1)
-                parts.append((percentile ** 0.55) * (confidence ** 0.45) * weights[m])
+                # Absolute confidence dominates; rank only breaks ties between
+                # otherwise comparable candidates.
+                evidence = (confidence ** 0.72) * (percentile ** 0.28)
+                parts.append(evidence * weights[m])
 
-            denom = sum(weights[m] for m in active) or 1.0
+            denom = sum(weights[m] for m in positive) or 1.0
             base = sum(parts) / denom
-            consensus = len(active) / len(methods)
-            agreement = 0.70 + 0.30 * consensus
+            supporters = [m for m in positive if raw[f][m] >= self.support_threshold]
+            consensus = len(supporters) / len(methods)
+            agreement = 0.65 + 0.35 * consensus
             combined = 100.0 * base * agreement
+
             best = max(methods, key=lambda m: raw[f][m])
             finger = fingers[f].get(best, next(iter(fingers[f].values()), "n/a"))
-
             fused.append(FusedResult(
                 filename=f,
                 combined_score=float(np.clip(combined, 0, 100)),
                 per_method=raw[f],
                 best_method=best,
-                n_active=len(active),
+                n_active=len(positive),
                 inliers=inl[f],
                 ranks={m: ranks[m][f] for m in methods},
                 consensus=consensus,
                 matched_finger=finger,
             ))
 
-        fused.sort(key=lambda r: (r.combined_score, r.n_active,
+        fused.sort(key=lambda r: (r.combined_score, r.consensus,
                                   max(r.inliers.values())), reverse=True)
         return fused
