@@ -4,13 +4,31 @@ import numpy as np
 
 
 class MatchScorer:
-    """Score assoluto e conservativo, indipendente dal database corrente."""
+    """Converte l'evidenza dei matcher in score comparabili 0..100."""
 
     def __init__(self, config):
         self.cfg = config
 
+    @staticmethod
+    def _nbis_score(native: float) -> float:
+        """Initial calibration for BOZORTH3.
+
+        BOZORTH3 has its own score scale; it is not averaged directly with
+        OpenCV scores. The mapping is intentionally conservative and can be
+        recalibrated later from the benchmark dataset.
+        """
+        s = max(float(native), 0.0)
+        if s < 10.0:
+            return 0.0
+        # Smooth saturation: 20≈50, 40≈78, 60≈90, 100≈97.
+        return float(np.clip(100.0 * (1.0 - np.exp(-(s - 10.0) / 22.0)), 0, 100))
+
     def score(self, verification, match_score=None, n_feat_query=0,
               n_feat_ref=0, method="sift") -> float:
+        if method == "nbis":
+            native = float(getattr(match_score, "native_score", 0.0)) if match_score is not None else 0.0
+            return self._nbis_score(native)
+
         n_inliers = int(getattr(verification, "n_inliers", verification))
         geometry = float(getattr(verification, "geometry_quality", 1.0))
         n_good = int(getattr(match_score, "n_good", n_inliers)) if match_score is not None else n_inliers
