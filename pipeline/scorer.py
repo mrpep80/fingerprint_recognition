@@ -1,53 +1,35 @@
-"""
-pipeline/scorer.py – v2.2
-===========================
-Formula: geometric mean di inlier_strength e coverage.
-
-  inlier_strength = min(1, n_inliers / target_inliers)
-      → penalizza match con pochi inlier assoluti
-
-  coverage = min(cov_query, cov_ref)
-      → penalizza match in cui il frammento/riferimento è poco coperto
-
-  score = sqrt(strength × coverage) × 100
-
-Separazione attesa:
-  Match genuino (>40 inliers)  → 60-100%
-  Falso positivo strutturale   → 15-30%
-  Falso positivo casuale       →  0-10%
-"""
+from __future__ import annotations
 
 import numpy as np
-from ..config import Config
 
 
 class MatchScorer:
+    """Score assoluto e conservativo, indipendente dal database corrente."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config):
         self.cfg = config
 
-    def score(
-        self,
-        n_inliers:    int,
-        n_good:       int,
-        n_feat_query: int,
-        n_feat_ref:   int = 0,
-    ) -> float:
+    def score(self, verification, match_score=None, n_feat_query=0,
+              n_feat_ref=0, method="sift") -> float:
+        n_inliers = int(getattr(verification, "n_inliers", verification))
+        geometry = float(getattr(verification, "geometry_quality", 1.0))
+        n_good = int(getattr(match_score, "n_good", n_inliers)) if match_score is not None else n_inliers
+
         if n_inliers < self.cfg.min_inliers:
             return 0.0
 
-        # Forza assoluta: quanti inlier abbiamo rispetto al target?
-        target   = self.cfg.score_bonus_ref     # riutilizziamo questo campo (default 80)
-        strength = min(1.0, n_inliers / target)
+        if method == "minutiae":
+            target = self.cfg.minutiae_score_target
+            consensus = np.clip((n_inliers / max(n_good, 1) - 0.35) / 0.65, 0, 1)
+            strength = np.clip(n_inliers / target, 0, 1)
+            score = 100 * (strength ** 0.65) * (consensus ** 0.35) * geometry
+            return float(np.clip(score, 0, 100))
 
-        # Copertura bidirezionale
-        cov_q = n_inliers / max(n_feat_query, 1)
-        if n_feat_ref > 0:
-            cov_r    = n_inliers / max(n_feat_ref, 1)
-            coverage = min(cov_q, cov_r)
-        else:
-            coverage = cov_q
-
-        # Media geometrica: penalizza se uno dei due è basso
-        combined = (strength * coverage) ** 0.5
-        return float(np.clip(combined * 100, 0.0, 100.0))
+        target = self.cfg.descriptor_score_target
+        inlier_ratio = n_inliers / max(n_good, 1)
+        coverage = n_inliers / max(min(n_feat_query, n_feat_ref or n_feat_query), 1)
+        coverage_term = np.clip(np.sqrt(coverage * self.cfg.coverage_scale), 0, 1)
+        strength = np.clip(n_inliers / target, 0, 1) ** 0.65
+        consensus = np.clip((inlier_ratio - 0.08) / 0.42, 0, 1) ** 0.35
+        score = 100 * strength * consensus * max(0.35, coverage_term) * geometry
+        return float(np.clip(score, 0, 100))
