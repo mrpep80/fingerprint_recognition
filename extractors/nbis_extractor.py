@@ -14,12 +14,11 @@ from .base import BaseExtractor, FeatureSet
 
 
 class NBISExtractor(BaseExtractor):
-    """MINDTCT adapter.
+    """MINDTCT adapter using the original fingerprint pixels.
 
-    MINDTCT is kept independent from the OpenCV preprocessing pipeline: NBIS
-    receives the original fingerprint image when a source path is available.
-    For card ROIs (which have no source file) a temporary 8-bit grayscale PNG
-    is created.
+    NBIS documentation lists baseline/lossless JPEG, WSQ and ANSI/NIST among
+    its supported inputs. To keep TIFF/PNG/BMP references compatible, those
+    images are converted to a temporary high-quality baseline JPEG first.
     """
 
     name = "nbis"
@@ -41,20 +40,33 @@ class NBISExtractor(BaseExtractor):
     def is_available(self) -> bool:
         return bool(self.mindtct)
 
+    def _make_compatible_input(self, img: np.ndarray, source_path: Optional[str]):
+        if source_path and Path(source_path).is_file() and Path(source_path).suffix.lower() in {".jpg", ".jpeg", ".wsq"}:
+            return source_path, None
+
+        gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = np.asarray(gray, dtype=np.uint8)
+        fd, temp_input = tempfile.mkstemp(prefix="nbis_fp_", suffix=".jpg")
+        os.close(fd)
+        # Baseline JPEG is explicitly supported by MINDTCT; quality 100 keeps
+        # the conversion as lossless as possible for this compatibility step.
+        if not cv2.imwrite(temp_input, gray, [cv2.IMWRITE_JPEG_QUALITY, 100]):
+            try:
+                os.unlink(temp_input)
+            except OSError:
+                pass
+            raise RuntimeError("impossibile scrivere input JPEG temporaneo per NBIS")
+        return temp_input, temp_input
+
     def extract(self, img: np.ndarray) -> FeatureSet:
         if not self.mindtct:
             return FeatureSet(metadata={"source": "nbis", "error": "mindtct non trovato"}, source=self.name)
 
-        input_path = self._source_path
         temp_input = None
-        if not input_path or not Path(input_path).is_file():
-            fd, temp_input = tempfile.mkstemp(prefix="nbis_fp_", suffix=".png")
-            os.close(fd)
-            gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            gray = np.asarray(gray, dtype=np.uint8)
-            if not cv2.imwrite(temp_input, gray):
-                return FeatureSet(metadata={"source": "nbis", "error": "impossibile scrivere input temporaneo"}, source=self.name)
-            input_path = temp_input
+        try:
+            input_path, temp_input = self._make_compatible_input(img, self._source_path)
+        except Exception as exc:
+            return FeatureSet(metadata={"source": "nbis", "error": str(exc)}, source=self.name)
 
         root_dir = tempfile.mkdtemp(prefix="nbis_mindtct_")
         root = os.path.join(root_dir, "fp")
