@@ -18,7 +18,8 @@ from pathlib import Path
 
 import cv2
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+#sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint_matcher.config import Config
 from fingerprint_matcher.pipeline.engine import FingerprintEngine
