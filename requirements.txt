@@ -1,16 +1,12 @@
-# Fingerprint Fragment Matcher v2.0 – dipendenze
+# Fingerprint Fragment Matcher v5 – dipendenze Python
 # pip install -r requirements.txt
 
-# OpenCV con moduli extra (SIFT, FLANN, AKAZE, ORB, ximgproc per thinning)
 opencv-contrib-python>=4.5.0
-
-# Algebra lineare e array
 numpy>=1.20.0
-
-# (Opzionale) NBIS per estrazione minuzie di qualità forense
-# Su Ubuntu/Debian:  sudo apt install nbis
-# Senza NBIS il sistema usa l'implementazione OpenCV interna
-
-# Hong-Jain fingerprint enhancement (Gabor orientato, stima locale freq/orientazione)
-# Implementa il preprocessing standard NBIS-compatible
 fingerprint-enhancer>=0.0.6
+
+# NBIS/MINDTCT/BOZORTH3 NON viene installato da pip.
+# Installare NBIS separatamente e assicurarsi che `mindtct` e `bozorth3`
+# siano nel PATH, oppure impostare:
+#   NBIS_MINDTCT=/percorso/a/mindtct
+#   NBIS_BOZORTH3=/percorso/a/bozorth3
