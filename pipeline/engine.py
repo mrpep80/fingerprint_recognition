@@ -14,7 +14,6 @@ from ..preprocessing.card_segmenter import CardSegmenter
 from ..extractors import get_extractor
 from ..extractors.base import FeatureSet
 from ..matchers import get_matcher
-from ..matchers.base import MatchScore
 from ..pipeline.verifier import RANSACVerifier
 from ..pipeline.scorer import MatchScorer
 
@@ -31,6 +30,7 @@ class MatchResult:
     matched_finger: str = "n/a"
     n_rois: int = 0
     geometry_quality: float = 0.0
+    native_score: float = 0.0
 
     def __lt__(self, other):
         return self.score < other.score
@@ -65,6 +65,7 @@ class FingerprintEngine:
         self.scorer = MatchScorer(config)
         self._pipelines = self._build_pipelines(method)
         self._frag_features: Dict[str, FeatureSet] = {}
+        self._frag_path: Optional[str] = None
 
     def prepare_fragment(self, frag_img: np.ndarray,
                          frag_path: Optional[str] = None) -> Dict[str, int]:
@@ -73,6 +74,10 @@ class FingerprintEngine:
         frag_gray = self.preprocessor.resize_to_working(self.preprocessor.to_gray(frag_img))
         stats = {}
         for pl in self._pipelines:
+            # NBIS/MINDTCT should see the original fingerprint image, not the
+            # Gabor/CLAHE representation used by the OpenCV descriptors.
+            if hasattr(pl.extractor, "set_source_path"):
+                pl.extractor.set_source_path(frag_path)
             inp = frag_gray if pl.extractor.needs_raw_input else frag_proc
             fs = pl.extractor.extract(inp)
             self._frag_features[pl.extractor.name] = fs
@@ -114,15 +119,16 @@ class FingerprintEngine:
         ref_img = cv2.imread(str(ref_path))
         if ref_img is None:
             return MatchResult(ref_path.name, 0, 0, 0, 0, self.method)
-        return self._compare_reference(ref_img, ref_path.name)
+        return self._compare_reference(ref_img, ref_path.name, str(ref_path))
 
-    def _compare_reference(self, ref_img: np.ndarray, filename: str = "reference") -> MatchResult:
+    def _compare_reference(self, ref_img: np.ndarray, filename: str = "reference",
+                           ref_path: Optional[str] = None) -> MatchResult:
         # Scheda: solo le 10 ROI. Impronta singola: confronto diretto.
         if self.try_rois and self.segmenter.is_card(ref_img):
             rois = self.segmenter.extract_rois(ref_img)
             best: Optional[MatchResult] = None
             for i, roi in enumerate(rois[:10]):
-                r = self._compare_image(roi)
+                r = self._compare_image(roi, None)
                 r.matched_finger = (self.segmenter.FINGER_NAMES[i]
                                     if i < len(self.segmenter.FINGER_NAMES) else f"ROI {i+1}")
                 r.n_rois = len(rois)
@@ -131,17 +137,19 @@ class FingerprintEngine:
             if best is not None:
                 best.filename = filename
                 return best
-        r = self._compare_image(ref_img)
+        r = self._compare_image(ref_img, ref_path)
         r.filename = filename
         return r
 
-    def _compare_image(self, ref_img: np.ndarray) -> MatchResult:
+    def _compare_image(self, ref_img: np.ndarray,
+                       ref_path: Optional[str] = None) -> MatchResult:
         ref_proc = self.preprocessor.preprocess(ref_img, self.use_gabor)
         ref_gray = self.preprocessor.resize_to_working(self.preprocessor.to_gray(ref_img))
         total = 0.0
         best_inl = 0
         best_good = 0
         best_gq = 0.0
+        best_native = 0.0
         min_src = "n/a"
         nfeat = max((fs.n_features for fs in self._frag_features.values()), default=0)
 
@@ -149,20 +157,36 @@ class FingerprintEngine:
             frag_fs = self._frag_features.get(pl.extractor.name)
             if frag_fs is None or not frag_fs.is_valid():
                 continue
+            if hasattr(pl.extractor, "set_source_path"):
+                # For a direct gallery fingerprint NBIS can consume the actual
+                # file. For a card ROI there is deliberately no source path.
+                pl.extractor.set_source_path(ref_path)
             inp = ref_gray if pl.extractor.needs_raw_input else ref_proc
             ref_fs = pl.extractor.extract(inp)
-            ms = pl.matcher.match(frag_fs, ref_fs)
-            vr = self.verifier.verify(frag_fs, ref_fs, ms)
-            score = self.scorer.score(vr, ms, frag_fs.n_features,
-                                      ref_fs.n_features, method=pl.extractor.name)
-            total += score * pl.weight
-            if vr.n_inliers > best_inl:
-                best_inl = vr.n_inliers
+
+            if pl.extractor.name == "nbis":
+                ms = pl.matcher.match(frag_fs, ref_fs)
+                score = self.scorer.score(None, ms, frag_fs.n_features,
+                                          ref_fs.n_features, method="nbis")
+                best_native = ms.native_score
+                best_inl = 0
                 best_good = ms.n_good
-                best_gq = vr.geometry_quality
+                best_gq = 1.0 if ms.is_verified else 0.0
+            else:
+                ms = pl.matcher.match(frag_fs, ref_fs)
+                vr = self.verifier.verify(frag_fs, ref_fs, ms)
+                score = self.scorer.score(vr, ms, frag_fs.n_features,
+                                          ref_fs.n_features, method=pl.extractor.name)
+                if vr.n_inliers > best_inl:
+                    best_inl = vr.n_inliers
+                    best_good = ms.n_good
+                    best_gq = vr.geometry_quality
+
+            total += score * pl.weight
             if pl.extractor.name == "minutiae":
                 min_src = frag_fs.metadata.get("source", "n/a")
 
         return MatchResult("reference", float(np.clip(total, 0, 100)),
                            best_inl, best_good, nfeat, self.method,
-                           min_src, geometry_quality=best_gq)
+                           min_src, geometry_quality=best_gq,
+                           native_score=best_native)
