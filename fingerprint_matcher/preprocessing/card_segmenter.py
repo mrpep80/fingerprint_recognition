@@ -1,242 +1,476 @@
 """
 preprocessing/card_segmenter.py
 ================================
-Segmentazione intelligente delle immagini di riferimento.
+Estrazione delle 10 impronte da schede dattiloscopiche standard.
 
-Gestisce DUE tipi di immagini:
-  1. Scheda dattiloscopica COMPLETA (es. modulo AFIS italiano)
-     → estrae 10 impronte singole dalla griglia 5×2
-     → per ogni modello: 10 confronti con il frammento
+Approccio scale-invariant
+--------------------------
+NON usa coordinate pixel assolute o proporzioni fisse.
+Invece, analizza la struttura visiva reale dell'immagine scansionata.
 
-  2. Impronta SINGOLA (già ritagliata)
-     → restituisce lista vuota (l'engine usa l'immagine intera)
+Tecnica chiave: run-length orizzontale
+  Per ogni riga dell'immagine, misura la lunghezza massima dei pixel scuri
+  contigui (max_run). Questo distingue:
 
-Rilevamento automatico del tipo:
-  - Scheda: formato ritratto, altezza > 1500px, aspect ratio < 0.85
-  - Singola: tutto il resto
+  - LINEE DELLA GRIGLIA:  max_run > 20% larghezza (linea nera lunga)
+  - CONTENUTO IMPRONTA:   dark_pct > 5%,  max_run < 20%  (creste curve)
+  - TESTO/ETICHETTE:      max_run moderato in poche righe concentrate
+  - SPAZIO VUOTO:         dark_pct ≈ 0%,  max_run ≈ 0
 
-Strategia di estrazione per schede:
-  A) Grid-based (principale): divide la zona impronte in griglia 5×2
-     basandosi sui GAP bianchi identificati nel profilo di varianza verticale
-  B) Blob-based (fallback): blob detection morfologica con parametri ridotti
+Pipeline di estrazione
+----------------------
+  1. Scansiona il profilo run-length verticale dell'intera immagine
+  2. Identifica le LINEE STRUTTURALI (max_run > MIN_LINE_RATIO * width)
+  3. Tra le linee strutturali, trova le ZONE DI CONTENUTO (fingerprint)
+  4. La sezione "ROLLED IMPRESSIONS" = area con due zone di contenuto
+     separate da una linea strutturale o da una zona vuota
+  5. Divide quella sezione in 5 colonne uniformi
+  6. Estrae 10 ROI: 5 per la mano destra + 5 per la mano sinistra
 
-Torna le ROI ordinate per posizione: [P.Dx, I.Dx, M.Dx, A.Dx, Mi.Dx,
-                                       P.Sx, I.Sx, M.Sx, A.Sx, Mi.Sx]
+Funziona indipendentemente da:
+  - Risoluzione scanner (200/300/400/600 DPI)
+  - Posizione della scheda nell'area di scansione
+  - Formato/dimensione del foglio
 """
 
 from __future__ import annotations
+
 import cv2
 import numpy as np
 from typing import List, Optional, Tuple
+
 from ..config import Config
 
 
 class CardSegmenter:
-    """Segmenta schede dattiloscopiche ed estrae le singole impronte."""
 
-    # Nomi delle 10 posizioni (usati per il debug)
     FINGER_NAMES = [
         "Pollice Dx",  "Indice Dx",  "Medio Dx",  "Anulare Dx",  "Mignolo Dx",
         "Pollice Sx",  "Indice Sx",  "Medio Sx",  "Anulare Sx",  "Mignolo Sx",
     ]
 
+    MIN_VALID_ROIS = 8
+
+    # Una riga con max_run > MIN_LINE_RATIO * width è una "linea strutturale"
+    MIN_LINE_RATIO = 0.20   # 20% della larghezza
+
+    # Soglie per distinguere contenuto da spazio vuoto
+    CONTENT_DARK_PCT  = 0.05   # >5% pixel scuri = riga con contenuto
+    CONTENT_MIN_ROWS  = 80     # un blocco deve essere alto almeno 80px
+
     def __init__(self, config: Config):
         self.cfg = config
 
-    # ── API pubblica ───────────────────────────────────────────────────
+    # ── API pubblica ──────────────────────────────────────────────────
 
     def is_card(self, img: np.ndarray) -> bool:
-        """
-        Determina se l'immagine è una scheda completa (vs impronta singola).
-        Una scheda ha formato ritratto, è grande e ha aspect ratio < 0.85.
-        """
         h, w = img.shape[:2]
-        aspect = w / max(h, 1)
-        return aspect < 0.85 and h > 1500 and w > 1000
+        return w / max(h, 1) < 0.85 and h > 1500 and w > 1000
 
     def extract_rois(self, card: np.ndarray) -> List[np.ndarray]:
         """
-        Estrae le ROI dall'immagine.
+        Estrae le 10 ROI delle impronte dalla scheda.
 
-        - Se è una scheda dattiloscopica: restituisce fino a 10 impronte ordinate
-        - Se è un'impronta singola: restituisce lista vuota
-          (l'engine userà l'intera immagine)
-
-        Returns:
-            lista di array numpy in scala di grigi, una per impronta
+        Strategia:
+          A) Analisi run-length (principale, scale-invariant)
+          B) Per-column density (fallback se A fallisce)
         """
         if not self.is_card(card):
-            return []   # impronta singola → gestita dall'engine senza ROI
+            return []
 
         gray = self._to_gray(card)
-        h, w = gray.shape
 
-        # Strategia A: grid-based (affidabile per schede standard)
-        rois = self._extract_grid(gray)
-        if len(rois) >= 8:
+        rois = self._extract_via_runlength(gray)
+        valid = [r for r in rois if r.shape[0] > 60 and r.shape[1] > 60
+                 and r.std() > 20]
+        if len(valid) >= self.MIN_VALID_ROIS:
             return rois
 
-        # Strategia B: blob-based (fallback)
-        rois = self._extract_blobs(gray)
-        return rois
+        return self._extract_fallback(gray)
 
-    # ── Strategia A: Grid-based ────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    #  STRATEGIA A: Run-length analysis
+    # ─────────────────────────────────────────────────────────────────
 
-    def _extract_grid(self, gray: np.ndarray) -> List[np.ndarray]:
+    def _extract_via_runlength(self, gray: np.ndarray) -> List[np.ndarray]:
         """
-        Estrae le 10 impronte usando la struttura a griglia della scheda.
-
-        Algoritmo:
-          1. Calcola la varianza locale per ogni riga orizzontale
-          2. Trova i GAP (bande a bassa varianza = spazio bianco tra sezioni)
-          3. Identifica le due bande principali con le impronte per rotazione
-          4. Divide ciascuna banda in 5 colonne uguali → 10 celle
-          5. Verifica che ogni cella contenga davvero un'impronta (varianza > soglia)
+        Usa il profilo run-length per trovare la sezione delle impronte
+        e le due sotto-righe (mano destra e sinistra).
         """
         h, w = gray.shape
+        _, bw = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-        # Le rolled impressions si trovano nella fascia centrale della scheda.
-        # Limita la ricerca a questa zona per escludere header e plain impressions.
-        # Proporzioni empiriche per scheda dattiloscopica italiana standard:
-        #   header:            y = 0.00h – 0.18h
-        #   rolled row 1:      y = 0.18h – 0.44h
-        #   rolled row 2:      y = 0.44h – 0.70h
-        #   plain impressions: y = 0.70h – 1.00h
-        y_search_start = int(h * 0.15)
-        y_search_end   = int(h * 0.72)   # escludi plain impressions
-        search_region  = gray[y_search_start:y_search_end, :]
+        # Calcola per ogni riga: max_run e dark_pct
+        max_runs  = np.zeros(h, dtype=float)
+        dark_pcts = np.zeros(h, dtype=float)
+        for y in range(h):
+            row          = bw[y, :]
+            dark_pcts[y] = row.mean() / 255.0
+            max_runs[y]  = self._max_run_length(row) / w
 
-        # Calcola varianza locale per striscia orizzontale (finestra 40px)
-        sr_h = search_region.shape[0]
-        var_profile = np.array([
-            float(search_region[max(0, y-20):min(sr_h, y+20), :].std())
-            for y in range(sr_h)
-        ])
+        # Trova le linee strutturali (max_run > soglia)
+        struct_lines = self._find_structural_lines(max_runs)
 
-        # Trova le BANDE ATTIVE (varianza > soglia = contenuto ricco)
-        med_var = np.median(var_profile)
-        active_thresh = max(med_var * 0.58, 42.0)
-        is_active = var_profile > active_thresh
+        # Trova i blocchi di contenuto (fingerprint)
+        content_blocks = self._find_content_blocks(dark_pcts, max_runs, h)
 
-        # Raggruppa righe attive in bande continue
-        bands = self._find_bands(is_active, min_height=180, min_gap=60)
-
-        if len(bands) < 2:
+        # Identifica la sezione rolled impressions
+        section = self._find_rolled_section(struct_lines, content_blocks, h)
+        if section is None:
             return []
 
-        # Prendi le prime due bande nella zona di ricerca
-        # (ordinate per posizione verticale)
-        bands_sorted = sorted(bands, key=lambda b: b[0])
-        # Scegli le 2 bande con la varianza media più alta (= le impronte)
-        def band_score(b):
-            return var_profile[b[0]:b[1]].mean() * (b[1]-b[0])
-        fp_bands = sorted(bands_sorted, key=band_score, reverse=True)[:2]
-        fp_bands = sorted(fp_bands)   # ri-ordina per posizione y
+        y_top, y_bot, row1_blocks, row2_blocks = section
 
-        if len(fp_bands) < 2:
+        # Trova i confini delle due righe di impronte
+        row1_range = self._row_range(y_top, y_bot, row1_blocks, row2_blocks,
+                                      struct_lines, dark_pcts, which=1)
+        row2_range = self._row_range(y_top, y_bot, row1_blocks, row2_blocks,
+                                      struct_lines, dark_pcts, which=2)
+
+        if row1_range is None or row2_range is None:
             return []
 
-        # Converti le coordinate dalla search_region alle coordinate originali
-        row1 = (fp_bands[0][0] + y_search_start, fp_bands[0][1] + y_search_start)
-        row2 = (fp_bands[1][0] + y_search_start, fp_bands[1][1] + y_search_start)
-
-        # Estrai 5 celle per riga (divisione uniforme in 5 colonne)
+        # Dividi in 5 colonne e estrai 10 celle
+        col_dividers = self._column_dividers(gray, y_top, y_bot, w)
         rois: List[np.ndarray] = []
-        pad = self.cfg.roi_padding
 
-        for y1, y2 in [row1, row2]:
-            col_w = w // 5
-            for col in range(5):
-                x1 = max(0, col * col_w - pad // 2)
-                x2 = min(w, (col + 1) * col_w + pad // 2)
-                y1c = max(0, y1 - pad)
-                y2c = min(h, y2 + pad)
-                cell = gray[y1c:y2c, x1:x2]
-
-                # Verifica: la cella contiene un'impronta? (varianza locale > soglia)
-                if cell.size > 0 and cell.std() > 25.0:
-                    rois.append(cell)
-                else:
-                    # Aggiungi comunque per mantenere l'allineamento 10 dita
-                    rois.append(cell if cell.size > 0 else gray[0:10, 0:10])
+        for y1, y2 in [row1_range, row2_range]:
+            for i in range(5):
+                x1 = col_dividers[i]
+                x2 = col_dividers[i + 1]
+                cell = gray[y1:y2, x1:x2]
+                # Salta l'etichetta in cima alla cella
+                fp_start = self._find_fp_start(cell)
+                roi = gray[y1 + fp_start:y2, x1:x2]
+                rois.append(roi if roi.size > 0 else cell)
 
         return rois
 
-    def _find_bands(self, is_active: np.ndarray,
-                    min_height: int = 200,
-                    min_gap: int = 80) -> List[Tuple[int, int]]:
+    # ── Profilo run-length ────────────────────────────────────────────
+
+    @staticmethod
+    def _max_run_length(row: np.ndarray) -> int:
+        """Lunghezza massima di pixel contigui scuri (>0) in una riga."""
+        max_r, cur = 0, 0
+        for px in row:
+            if px > 0:
+                cur += 1
+                if cur > max_r:
+                    max_r = cur
+            else:
+                cur = 0
+        return max_r
+
+    def _find_structural_lines(self, max_runs: np.ndarray) -> List[int]:
         """
-        Trova bande contigue di righe attive, filtrando gap troppo piccoli.
+        Trova le righe che sono linee strutturali della griglia
+        (max_run > MIN_LINE_RATIO).
+        Raggruppa righe adiacenti nello stesso "cluster".
         """
-        h = len(is_active)
-        bands: List[Tuple[int, int]] = []
-        in_band = False
-        start = 0
-        gap_start = 0
+        is_line = max_runs > self.MIN_LINE_RATIO
+        lines: List[int] = []
+        in_line, start = False, 0
+
+        for y, v in enumerate(is_line):
+            if v and not in_line:
+                in_line, start = True, y
+            elif not v and in_line:
+                in_line = False
+                center = (start + y) // 2
+                lines.append(center)
+
+        if in_line:
+            lines.append((start + len(is_line)) // 2)
+
+        return lines
+
+    def _find_content_blocks(
+        self,
+        dark_pcts: np.ndarray,
+        max_runs:  np.ndarray,
+        h:         int,
+    ) -> List[Tuple[int, int]]:
+        """
+        Trova i blocchi di righe con contenuto reale:
+        dark_pct > soglia E max_run < MIN_LINE_RATIO (= non è una linea).
+        I blocchi "fingerprint" hanno contenuto distribuito, non righe lunghe.
+        """
+        is_content = (dark_pcts > self.CONTENT_DARK_PCT) & \
+                     (max_runs  < self.MIN_LINE_RATIO)
+
+        blocks: List[Tuple[int, int]] = []
+        in_block, start, gap = False, 0, 0
 
         for y in range(h):
-            if is_active[y] and not in_band:
-                # Controlla se il gap precedente era abbastanza lungo
-                if bands and (y - gap_start) < min_gap:
-                    # Gap troppo corto → estendi la banda precedente
-                    start_prev, _ = bands.pop()
-                    start = start_prev
+            if is_content[y]:
+                if not in_block:
+                    in_block, start, gap = True, y, 0
                 else:
-                    start = y
-                in_band = True
-            elif not is_active[y] and in_band:
-                in_band = False
-                gap_start = y
-                if y - start >= min_height:
-                    bands.append((start, y))
+                    gap = 0
+            else:
+                if in_block:
+                    gap += 1
+                    if gap > 60:
+                        in_block = False
+                        if y - start - gap >= self.CONTENT_MIN_ROWS:
+                            blocks.append((start, y - gap))
 
-        if in_band and h - start >= min_height:
-            bands.append((start, h))
+        if in_block and h - start >= self.CONTENT_MIN_ROWS:
+            blocks.append((start, h))
 
-        return bands
+        return blocks
 
-    # ── Strategia B: Blob-based (fallback) ───────────────────────────
+    # ── Sezione rolled impressions ───────────────────────────────────
 
-    def _extract_blobs(self, gray: np.ndarray) -> List[np.ndarray]:
+    def _find_rolled_section(
+        self,
+        struct_lines:   List[int],
+        content_blocks: List[Tuple[int, int]],
+        h:              int,
+    ) -> Optional[Tuple[int, int, List, List]]:
         """
-        Fallback: trova blob scuri (impronte) con morfologia ridotta.
-        Funziona anche su schede non standard.
+        Identifica la sezione delle rolled impressions come l'area che:
+          - Contiene ESATTAMENTE DUE blocchi di contenuto separati
+          - I due blocchi = mano destra e mano sinistra
+
+        Strategia:
+          Cerca la coppia (b1, b2) di content_blocks più grandi e
+          verticalmente separati (tra loro c'è uno spazio o una linea).
+          L'area va dal bordo superiore di b1 al bordo inferiore di b2.
+        """
+        if len(content_blocks) < 2:
+            return None
+
+        # Ordina per dimensione (i due blocchi più grandi)
+        sorted_by_size = sorted(content_blocks,
+                                key=lambda b: b[1]-b[0], reverse=True)
+        top2 = sorted(sorted_by_size[:2], key=lambda b: b[0])
+        b1, b2 = top2[0], top2[1]
+
+        # Verifica che siano separati (b1 termina prima che b2 inizi)
+        if b1[1] >= b2[0]:
+            return None
+
+        # I confini della sezione: espandi un po' sopra b1 e sotto b2
+        # per includere le etichette
+        pad = 20
+        y_top = max(0, b1[0] - 200)   # 200px sopra la prima impronta = c'è lo spazio etichette
+        y_bot = min(h, b2[1] + pad)
+
+        # Raffina y_top cercando la prima linea strutturale sopra b1
+        lines_above_b1 = [l for l in struct_lines if l < b1[0]]
+        if lines_above_b1:
+            # La linea strutturale più vicina a b1 (dall'alto)
+            closest = max(lines_above_b1)
+            y_top = closest
+
+        # Raffina y_bot cercando la prima linea strutturale sotto b2
+        lines_below_b2 = [l for l in struct_lines if l > b2[1]]
+        if lines_below_b2:
+            closest = min(lines_below_b2)
+            y_bot = closest
+
+        return (y_top, y_bot, [b1], [b2])
+
+    def _row_range(
+        self,
+        y_top:        int,
+        y_bot:        int,
+        row1_blocks:  List,
+        row2_blocks:  List,
+        struct_lines: List[int],
+        dark_pcts:    np.ndarray,
+        which:        int,   # 1 = mano destra, 2 = mano sinistra
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Determina i confini verticali di una riga di impronte.
+
+        La riga include l'etichetta sopra (es. "1. Pollice sinistro")
+        E l'impronta stessa sotto.
+
+        Per riga 1: da y_top alla linea che divide le due righe
+        Per riga 2: dalla linea divisoria a y_bot
+        """
+        b1 = row1_blocks[0]
+        b2 = row2_blocks[0]
+
+        # La linea divisoria = punto medio tra fine di b1 e inizio di b2
+        gap_start = b1[1]
+        gap_end   = b2[0]
+        mid_y     = (gap_start + gap_end) // 2
+
+        # Raffina cercando una linea strutturale nel gap
+        lines_in_gap = [l for l in struct_lines if gap_start <= l <= gap_end]
+        if lines_in_gap:
+            mid_y = min(lines_in_gap, key=lambda l: abs(l - mid_y))
+
+        # Oppure: cerca il punto di minimo dark_pct nel gap
+        if gap_end > gap_start and not lines_in_gap:
+            gap_profile = dark_pcts[gap_start:gap_end]
+            if len(gap_profile) > 0:
+                mid_idx = int(np.argmin(gap_profile))
+                mid_y   = gap_start + mid_idx
+
+        if which == 1:
+            return (y_top, mid_y)
+        else:
+            return (mid_y, y_bot)
+
+    # ── Divisori di colonna ──────────────────────────────────────────
+
+    def _column_dividers(
+        self,
+        gray:  np.ndarray,
+        y_top: int,
+        y_bot: int,
+        w:     int,
+    ) -> List[int]:
+        """
+        Trova i 6 punti x che delimitano le 5 colonne.
+
+        Prova a rilevare le linee verticali nell'area delle impronte.
+        Se ne trova 4 interne ben spaziate → le usa.
+        Altrimenti → divisione uniforme in 5 parti.
+        """
+        h = gray.shape[0]
+        zone = gray[y_top:y_bot, :]
+        _, bw = cv2.threshold(zone, 200, 255, cv2.THRESH_BINARY_INV)
+
+        # Kernel verticale proporzionale alla zona
+        min_v = max(10, (y_bot - y_top) // 6)
+        v_kern = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_v))
+        v_det  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, v_kern)
+        v_proj = v_det.sum(axis=0).astype(float)
+
+        if v_proj.max() > 0:
+            v_proj /= v_proj.max()
+
+        # Cluster linee verticali
+        v_thresh = 0.15
+        v_cands  = np.where(v_proj > v_thresh)[0]
+        v_groups: List[int] = []
+        if len(v_cands):
+            gs, prev = int(v_cands[0]), int(v_cands[0])
+            for c in v_cands[1:]:
+                c = int(c)
+                if c - prev > 15:
+                    v_groups.append((gs + prev) // 2)
+                    gs = c
+                prev = c
+            v_groups.append((gs + prev) // 2)
+
+        # Mantieni solo i divisori interni (non troppo vicini ai bordi)
+        internal = [x for x in v_groups if w * 0.05 < x < w * 0.95]
+        exp = w / 5
+
+        # Cerca i 4 più vicini alle posizioni attese
+        chosen: List[int] = []
+        for i in range(1, 5):
+            target = int(w * i / 5)
+            cands  = [x for x in internal if abs(x - target) < exp * 0.35]
+            if cands:
+                chosen.append(min(cands, key=lambda x: abs(x - target)))
+
+        if len(chosen) == 4:
+            return [0] + sorted(chosen) + [w]
+
+        # Fallback: divisione uniforme
+        cw = w // 5
+        return [cw * i for i in range(6)]
+
+    # ── Start impronta (salta etichetta) ─────────────────────────────
+
+    def _find_fp_start(self, cell: np.ndarray) -> int:
+        """
+        Trova dove inizia l'impronta vera dentro la cella (salta l'etichetta).
+        L'impronta = contenuto STABILE e DISTRIBUITO (creste su area larga).
+        L'etichetta = contenuto CONCENTRATO su poche righe.
+        """
+        if cell.size == 0 or cell.shape[0] < 40:
+            return 0
+
+        ch = cell.shape[0]
+        gray = cell if cell.ndim == 2 else cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+        dark = (gray < 100).mean(axis=1)
+
+        # Media mobile per lisciare
+        k = max(3, ch // 25)
+        smooth = np.convolve(dark, np.ones(k)/k, mode='same')
+
+        # Soglia: 12% del valore massimo della cella
+        thresh = max(0.08, smooth.max() * 0.12)
+
+        # Cerca il primo punto con contenuto stabile (almeno k righe)
+        for y in range(int(ch * 0.05), int(ch * 0.80)):
+            window = smooth[y:min(y+k, ch)]
+            if len(window) > 0 and window.min() > thresh:
+                return max(0, y - 2)
+
+        return 0
+
+    # ─────────────────────────────────────────────────────────────────
+    #  STRATEGIA B: Fallback per-column density
+    # ─────────────────────────────────────────────────────────────────
+
+    def _extract_fallback(self, gray: np.ndarray) -> List[np.ndarray]:
+        """
+        Fallback: analisi densità per colonna.
+        Divide il card in 5 colonne uniformi e trova 2 blocchi per colonna.
         """
         h, w = gray.shape
-        total = h * w
+        col_w = w // 5
+        col_dividers = [col_w * i for i in range(6)]
 
-        _, bw = cv2.threshold(gray, 0, 255,
-                              cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-        # Morfologia RIDOTTA per non fondere le impronte adiacenti
-        k_small = np.ones((3, 3), np.uint8)
-        k_med   = np.ones((5, 5), np.uint8)
-        closed  = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k_small, iterations=2)
-        dilated = cv2.dilate(closed, k_med, iterations=1)
+        right_hand: List[np.ndarray] = []
+        left_hand:  List[np.ndarray] = []
 
-        cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+        for i in range(5):
+            x1, x2 = col_dividers[i], col_dividers[i+1]
+            col = gray[:, x1:x2]
+            dark = (col < 100).mean(axis=1)
+            k = max(3, h // 30)
+            smooth = np.convolve(dark, np.ones(k)/k, mode='same')
+            is_act = smooth > 0.10
 
-        rois: List[np.ndarray] = []
-        for cnt in sorted(cnts, key=cv2.contourArea, reverse=True):
-            area = cv2.contourArea(cnt)
-            if not (total * 0.001 < area < total * 0.05):
-                continue
-            x, y, bw2, bh2 = cv2.boundingRect(cnt)
-            asp = bw2 / max(bh2, 1)
-            if not (0.25 < asp < 3.5):
-                continue
-            p = self.cfg.roi_padding
-            roi = gray[max(0,y-p):min(h,y+bh2+p),
-                       max(0,x-p):min(w,x+bw2+p)]
-            if roi.shape[0] >= self.cfg.roi_min_side and \
-               roi.shape[1] >= self.cfg.roi_min_side:
-                rois.append(roi)
-            if len(rois) >= 15:
-                break
+            blocks: List[Tuple[int, int]] = []
+            in_b, start, gap = False, 0, 0
+            for y, v in enumerate(is_act):
+                if v:
+                    if not in_b: in_b, start, gap = True, y, 0
+                    else: gap = 0
+                else:
+                    if in_b:
+                        gap += 1
+                        if gap > 50:
+                            in_b = False
+                            if y - start - gap >= 80:
+                                blocks.append((start, y - gap))
+            if in_b and h - start >= 80:
+                blocks.append((start, h))
 
-        return rois
+            blocks.sort(key=lambda b: b[1]-b[0], reverse=True)
+            top2 = sorted(blocks[:2])
 
-    # ── Utility ───────────────────────────────────────────────────────
+            pad = self.cfg.roi_padding
+
+            def crop(b):
+                return gray[max(0, b[0]-pad):min(h, b[1]+pad),
+                            max(0, x1-pad):min(w, x2+pad)]
+
+            if len(top2) >= 2:
+                right_hand.append(crop(top2[0]))
+                left_hand.append(crop(top2[1]))
+            elif len(top2) == 1:
+                mid = h // 2
+                right_hand.append(crop(top2[0]))
+                left_hand.append(crop((mid, h)))
+            else:
+                right_hand.append(gray[h//4:h//2, x1:x2])
+                left_hand.append(gray[h//2:h*3//4, x1:x2])
+
+        return right_hand + left_hand
+
+    # ── Utility ──────────────────────────────────────────────────────
 
     def _to_gray(self, img: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
