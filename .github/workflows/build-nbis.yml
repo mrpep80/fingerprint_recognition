@@ -1,0 +1,162 @@
+name: Build NBIS runtimes
+
+on:
+  workflow_dispatch:
+    inputs:
+      nbis_ref:
+        description: "NBIS source ref/tag/commit"
+        required: true
+        default: "master"
+        type: string
+  push:
+    tags:
+      - "nbis-*"
+
+permissions:
+  contents: read
+
+# NBIS 5.0.0 is old software. Keep the source ref explicit so the build is
+# reproducible. Before distributing BOZORTH3, verify that your use/distribution
+# is authorized under the applicable NIST NBIS-EC terms.
+env:
+  NBIS_REPOSITORY: https://github.com/lessandro/nbis.git
+
+jobs:
+  build:
+    name: NBIS ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-x64
+            runner: macos-15-intel
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: windows-x64
+            runner: windows-2025
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v6
+
+      - name: Checkout NBIS source
+        shell: bash
+        env:
+          NBIS_REF: ${{ inputs.nbis_ref || 'master' }}
+        run: |
+          git clone --depth 1 --branch "$NBIS_REF" "$NBIS_REPOSITORY" "$RUNNER_TEMP/nbis-src"
+          test -f "$RUNNER_TEMP/nbis-src/setup.sh"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install cmake
+
+      - name: Build NBIS on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          src="$RUNNER_TEMP/nbis-src"
+          install="$RUNNER_TEMP/nbis-install"
+          cd "$src"
+          ./setup.sh "$install" --without-X11
+          make config
+          make it
+          make install
+          test -x "$install/bin/mindtct"
+          test -x "$install/bin/bozorth3"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifact/bin"
+          cp "$install/bin/mindtct" "$GITHUB_WORKSPACE/artifact/bin/"
+          cp "$install/bin/bozorth3" "$GITHUB_WORKSPACE/artifact/bin/"
+
+      - name: Build NBIS on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          src="$RUNNER_TEMP/nbis-src"
+          install="$RUNNER_TEMP/nbis-install"
+          cd "$src"
+          ./setup.sh "$install" --without-X11 --64
+          make config
+          make it
+          make install
+          test -x "$install/bin/mindtct"
+          test -x "$install/bin/bozorth3"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifact/bin"
+          cp "$install/bin/mindtct" "$GITHUB_WORKSPACE/artifact/bin/"
+          cp "$install/bin/bozorth3" "$GITHUB_WORKSPACE/artifact/bin/"
+
+      - name: Install MSYS2 for Windows build
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            git
+
+      - name: Build NBIS on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          src="$RUNNER_TEMP/nbis-src"
+          install="$RUNNER_TEMP/nbis-install"
+          cd "$src"
+          ./setup.sh "$install" --MSYS --64
+          make config
+          make it
+          make install
+
+          test -f "$install/bin/mindtct.exe"
+          test -f "$install/bin/bozorth3.exe"
+
+          mkdir -p "$GITHUB_WORKSPACE/artifact/bin"
+          cp "$install/bin/mindtct.exe" "$GITHUB_WORKSPACE/artifact/bin/"
+          cp "$install/bin/bozorth3.exe" "$GITHUB_WORKSPACE/artifact/bin/"
+
+      - name: Smoke test NBIS
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f artifact/bin/mindtct${{ runner.os == 'Windows' && '.exe' || '' }}
+          test -f artifact/bin/bozorth3${{ runner.os == 'Windows' && '.exe' || '' }}
+          file artifact/bin/mindtct* || true
+          file artifact/bin/bozorth3* || true
+
+      - name: Package runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "release/${{ matrix.platform }}/bin"
+          cp artifact/bin/* "release/${{ matrix.platform }}/bin/"
+          cp "$RUNNER_TEMP/nbis-src/README*" "release/${{ matrix.platform }}/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/nbis-src/CHANGELOG.txt" "release/${{ matrix.platform }}/" 2>/dev/null || true
+          tar -C release -czf "nbis-${{ matrix.platform }}.tar.gz" "${{ matrix.platform }}"
+
+      - name: Upload NBIS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbis-${{ matrix.platform }}
+          path: nbis-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
