@@ -8,9 +8,6 @@ principale, perché sui test correnti tende a produrre falsi positivi.
 
 from __future__ import annotations
 
-import argparse
-import os
-import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,10 +15,10 @@ from pathlib import Path
 
 import cv2
 
-#sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fingerprint_matcher.config import Config
+from fingerprint_matcher.engines.nbis import get_nbis_runtime
 from fingerprint_matcher.pipeline.engine import FingerprintEngine
 from fingerprint_matcher.pipeline.fusion import ScoreFusion
 from fingerprint_matcher.io.loader import ImageLoader
@@ -38,9 +35,8 @@ SINGLE_METHODS = ["sift", "orb", "akaze", "minutiae", "enhanced_sift", "nbis"]
 
 
 def nbis_available() -> bool:
-    mindtct = os.environ.get("NBIS_MINDTCT") or shutil.which("mindtct") or shutil.which("mindtct.exe")
-    bozorth = os.environ.get("NBIS_BOZORTH3") or shutil.which("bozorth3") or shutil.which("bozorth3.exe")
-    return bool(mindtct and bozorth)
+    """Use the same portable runtime resolver as the extractor/matcher."""
+    return get_nbis_runtime().available
 
 
 def build_weights() -> dict:
@@ -86,7 +82,8 @@ def banner(args, weights):
     if args.method == "fusion":
         active = [f"{m}(×{w:g})" for m, w in weights.items() if w > 0]
         print("  Fusion  : " + ", ".join(active))
-        print(f"  NBIS    : {'disponibile' if weights.get('nbis', 0) > 0 else 'non disponibile'}")
+        runtime = get_nbis_runtime()
+        print(f"  NBIS    : {'disponibile' if runtime.available else 'non disponibile'} ({runtime.source})")
     print("═" * 78)
 
 
@@ -136,7 +133,7 @@ def main():
     banner(args, weights)
 
     if args.method == "nbis" and not nbis_available():
-        sys.exit("[ERRORE] NBIS non disponibile: installare mindtct e bozorth3 oppure impostare NBIS_MINDTCT/NBIS_BOZORTH3.")
+        sys.exit("[ERRORE] NBIS non disponibile: usare il runtime bundled oppure impostare NBIS_MINDTCT/NBIS_BOZORTH3.")
 
     cfg = Config()
     cfg.max_working_dim = args.max_dim
