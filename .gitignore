@@ -22,3 +22,5 @@ vis_*.jpg
 .vscode/
 .idea/
 *.swp
+
+*.egg-info/
