@@ -8,6 +8,7 @@ principale, perché sui test correnti tende a produrre falsi positivi.
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
