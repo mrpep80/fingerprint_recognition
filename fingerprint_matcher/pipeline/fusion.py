@@ -23,16 +23,21 @@ class FusedResult:
 
 
 class ScoreFusion:
-    """Evidence fusion without database min-max normalization.
+    """Evidence fusion for heterogeneous fingerprint matchers.
 
-    Every available engine contributes independently when it produces positive
-    evidence. Very small scores do not create false consensus: consensus is
-    counted only for scores >= support_threshold. This is important because
-    SIFT/ORB and BOZORTH3 naturally live on different score distributions.
+    Scores are assumed to be converted by each matcher/scorer to 0..100.
+    Missing/zero evidence is deliberately kept in the denominator: a candidate
+    supported by only one engine must not receive the same score as one with
+    independent support from several engines.
     """
 
-    def __init__(self, support_threshold: float = 5.0):
-        self.support_threshold = support_threshold
+    def __init__(self, support_threshold: float = 5.0,
+                 support_thresholds: Optional[Dict[str, float]] = None):
+        self.support_threshold = float(support_threshold)
+        self.support_thresholds = support_thresholds or {}
+
+    def _threshold(self, method: str) -> float:
+        return float(self.support_thresholds.get(method, self.support_threshold))
 
     def fuse(self, results_by_method: Dict[str, List],
              weights: Optional[Dict[str, float]] = None) -> List[FusedResult]:
@@ -41,6 +46,9 @@ class ScoreFusion:
         methods = list(results_by_method)
         weights = weights or {m: 1.0 for m in methods}
         weights = {m: max(float(weights.get(m, 0.0)), 0.0) for m in methods}
+        active_methods = [m for m in methods if weights[m] > 0]
+        if not active_methods:
+            return []
 
         files = sorted({r.filename for rs in results_by_method.values() for r in rs})
         raw = {f: {m: 0.0 for m in methods} for f in files}
@@ -60,31 +68,41 @@ class ScoreFusion:
             for m in methods
         }
         n = len(files)
+        denom = sum(weights[m] for m in active_methods) or 1.0
         fused = []
 
         for f in files:
-            positive = [m for m in methods if raw[f][m] > 0.0 and weights[m] > 0]
+            positive = [m for m in active_methods if raw[f][m] > 0.0]
             if not positive:
-                positive = [max(methods, key=lambda m: raw[f][m])]
+                best_raw_method = max(active_methods, key=lambda m: raw[f][m])
+                positive = [best_raw_method]
 
             parts = []
             for m in positive:
                 percentile = 1.0 - (ranks[m][f] - 1) / max(n - 1, 1)
                 confidence = np.clip(raw[f][m] / 100.0, 0, 1)
-                # Absolute confidence dominates; rank only breaks ties between
-                # otherwise comparable candidates.
                 evidence = (confidence ** 0.72) * (percentile ** 0.28)
                 parts.append(evidence * weights[m])
 
-            denom = sum(weights[m] for m in positive) or 1.0
+            # IMPORTANT: denom includes every active engine, including engines
+            # that returned zero evidence for this candidate. This prevents a
+            # one-engine false positive from being normalized as if it had
+            # multi-engine support.
             base = sum(parts) / denom
-            supporters = [m for m in positive if raw[f][m] >= self.support_threshold]
-            consensus = len(supporters) / len(methods)
-            agreement = 0.65 + 0.35 * consensus
+            supporters = [m for m in active_methods
+                          if raw[f][m] >= self._threshold(m)]
+            consensus = len(supporters) / len(active_methods)
+
+            # Keep a modest floor so a genuine single-engine result is not
+            # discarded completely, while still rewarding independent support.
+            agreement = 0.55 + 0.45 * consensus
             combined = 100.0 * base * agreement
 
-            best = max(methods, key=lambda m: raw[f][m])
-            finger = fingers[f].get(best, next(iter(fingers[f].values()), "n/a"))
+            best = max(active_methods, key=lambda m: raw[f][m])
+            # Never borrow a finger label from another engine: otherwise the
+            # reported finger can disagree with the engine that supplied the
+            # best score.
+            finger = fingers[f].get(best, "n/a")
             fused.append(FusedResult(
                 filename=f,
                 combined_score=float(np.clip(combined, 0, 100)),
