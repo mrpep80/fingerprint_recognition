@@ -1,0 +1,231 @@
+name: Build NBIS Binaries
+
+# Lancia manualmente o su ogni tag v*
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # ─── Linux x64 ─────────────────────────────────────────────────────
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake make gcc g++ libopenjp2-7-dev
+
+      - name: Download NBIS source
+        run: |
+          curl -L https://www.nist.gov/system/files/documents/2016/12/06/nbis_release5_0_0.zip \
+               -o nbis.zip
+          unzip -q nbis.zip
+          mv nbis_release5_0_0 nbis_src
+
+      - name: Build NBIS
+        run: |
+          cd nbis_src
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          make config
+          make it
+          make install INSTALL_ROOT_DIR=$PWD/install
+
+      - name: Copy binaries
+        run: |
+          DEST=fingerprint_matcher/engines/nbis/runtimes/linux-x64/bin
+          mkdir -p $DEST
+          cp nbis_src/install/bin/mindtct  $DEST/
+          cp nbis_src/install/bin/bozorth3 $DEST/
+          chmod +x $DEST/*
+          ls -lh $DEST/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nbis-linux-x64
+          path: fingerprint_matcher/engines/nbis/runtimes/linux-x64/
+
+  # ─── macOS ARM64 (Apple Silicon) ───────────────────────────────────
+  build-macos-arm64:
+    runs-on: macos-14        # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install cmake openjpeg
+
+      - name: Download NBIS source
+        run: |
+          curl -L https://www.nist.gov/system/files/documents/2016/12/06/nbis_release5_0_0.zip \
+               -o nbis.zip
+          unzip -q nbis.zip
+          mv nbis_release5_0_0 nbis_src
+
+      - name: Build NBIS
+        run: |
+          cd nbis_src
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          export CFLAGS="-fcommon"
+          make config
+          make it
+          make install INSTALL_ROOT_DIR=$PWD/install
+
+      - name: Copy binaries
+        run: |
+          DEST=fingerprint_matcher/engines/nbis/runtimes/darwin-arm64/bin
+          mkdir -p $DEST
+          cp nbis_src/install/bin/mindtct  $DEST/
+          cp nbis_src/install/bin/bozorth3 $DEST/
+          chmod +x $DEST/*
+          file $DEST/mindtct   # verifica architettura
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nbis-darwin-arm64
+          path: fingerprint_matcher/engines/nbis/runtimes/darwin-arm64/
+
+  # ─── macOS x64 (Intel) ─────────────────────────────────────────────
+  build-macos-x64:
+    runs-on: macos-13        # Intel runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install cmake openjpeg
+
+      - name: Download NBIS source
+        run: |
+          curl -L https://www.nist.gov/system/files/documents/2016/12/06/nbis_release5_0_0.zip \
+               -o nbis.zip
+          unzip -q nbis.zip
+          mv nbis_release5_0_0 nbis_src
+
+      - name: Build NBIS
+        run: |
+          cd nbis_src
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          export CFLAGS="-fcommon"
+          make config
+          make it
+          make install INSTALL_ROOT_DIR=$PWD/install
+
+      - name: Copy binaries
+        run: |
+          DEST=fingerprint_matcher/engines/nbis/runtimes/darwin-x64/bin
+          mkdir -p $DEST
+          cp nbis_src/install/bin/mindtct  $DEST/
+          cp nbis_src/install/bin/bozorth3 $DEST/
+          chmod +x $DEST/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nbis-darwin-x64
+          path: fingerprint_matcher/engines/nbis/runtimes/darwin-x64/
+
+  # ─── Windows x64 ──────────────────────────────────────────────────
+  build-windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSYS2 + MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-openjpeg2
+            unzip
+            curl
+
+      - name: Download and build NBIS
+        shell: msys2 {0}
+        run: |
+          curl -L "https://www.nist.gov/system/files/documents/2016/12/06/nbis_release5_0_0.zip" \
+               -o nbis.zip
+          unzip -q nbis.zip
+          mv nbis_release5_0_0 nbis_src
+          cd nbis_src
+
+          # Patch CMakeLists.txt per CMake moderno
+          find . -name "CMakeLists.txt" -exec \
+            sed -i 's/cmake_minimum_required(VERSION [0-9]*\.[0-9]*)/cmake_minimum_required(VERSION 3.5)/g' {} \;
+
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          make config
+          make it
+          make install INSTALL_ROOT_DIR=$PWD/install
+
+      - name: Copy binaries
+        shell: msys2 {0}
+        run: |
+          DEST=fingerprint_matcher/engines/nbis/runtimes/windows-x64/bin
+          mkdir -p $DEST
+          cp nbis_src/install/bin/mindtct.exe  $DEST/ 2>/dev/null || \
+          cp nbis_src/install/bin/mindtct      $DEST/mindtct.exe
+          cp nbis_src/install/bin/bozorth3.exe $DEST/ 2>/dev/null || \
+          cp nbis_src/install/bin/bozorth3     $DEST/bozorth3.exe
+
+          # Copia le DLL MinGW necessarie per runtime standalone
+          for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            cp /mingw64/bin/$dll $DEST/ 2>/dev/null || true
+          done
+          ls -lh $DEST/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nbis-windows-x64
+          path: fingerprint_matcher/engines/nbis/runtimes/windows-x64/
+
+  # ─── Commit binari nel repo ────────────────────────────────────────
+  commit-binaries:
+    needs:
+      - build-linux-x64
+      - build-macos-arm64
+      - build-macos-x64
+      - build-windows-x64
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: fingerprint_matcher/engines/nbis/runtimes/
+          merge-multiple: true
+
+      - name: Rendi eseguibili i binari Unix
+        run: |
+          find fingerprint_matcher/engines/nbis/runtimes -type f \
+            ! -name "*.exe" ! -name "*.dll" \
+            -exec chmod +x {} \;
+
+      - name: Commit e push binari
+        run: |
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add fingerprint_matcher/engines/nbis/runtimes/
+          git diff --cached --stat
+          git commit -m "chore: aggiorna binari NBIS compilati per tutte le piattaforme
+
+          Piattaforme incluse:
+            - linux-x64   (ubuntu-22.04, gcc)
+            - darwin-arm64 (macos-14, Apple Silicon)
+            - darwin-x64  (macos-13, Intel)
+            - windows-x64 (windows-2022, MinGW64)
+
+          Binari: mindtct, bozorth3 (+ DLL runtime Windows)
+          NBIS versione: Rel_5.0.0
+          [skip ci]" || echo "Nessun cambiamento da committare"
+          git push
