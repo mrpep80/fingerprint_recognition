@@ -21,7 +21,10 @@ dev = ["pytest", "black", "ruff"]
 [project.scripts]
 # Dopo 'pip install -e .' puoi usare direttamente:
 #   fingerprint-matcher frammento.jpg ./DBs/ --method fusion
-fingerprint-matcher = "fingerprint_matcher.main:main"
+fingerprint-matcher = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 where = ["."]
