@@ -1,12 +1,24 @@
-# Fingerprint Fragment Matcher v5 – dipendenze Python
-# pip install -r requirements.txt
+# Fingerprint Matcher v5 — cross-platform (Windows / macOS / Linux)
+#
+# Installazione standard:
+#   pip install -r requirements.txt
+#
+# Installazione come package (consigliata — abilita il comando fingerprint-matcher):
+#   pip install -e .
 
+# Core — computer vision e algebra lineare
 opencv-contrib-python>=4.5.0
 numpy>=1.20.0
+
+# Enhancer impronte (Hong-Jain, Gabor orientato localmente)
+# Sostituisce NBIS per la binarizzazione nel MinutiaeExtractor.
+# Cross-platform: nessuna compilazione, nessun tool di sistema.
 fingerprint-enhancer>=0.0.6
 
-# NBIS/MINDTCT/BOZORTH3 NON viene installato da pip.
-# Installare NBIS separatamente e assicurarsi che `mindtct` e `bozorth3`
-# siano nel PATH, oppure impostare:
-#   NBIS_MINDTCT=/percorso/a/mindtct
-#   NBIS_BOZORTH3=/percorso/a/bozorth3
+# ── OPZIONALE — qualità forense superiore ─────────────────────────────────
+# NBIS mindtct + bozorth3 abilita il metodo 'nbis' (peso ×2.2 nella fusion).
+# Se non installato, la fusion usa minutiae+sift+orb e nbis viene disabilitato.
+#
+#   macOS : vedi NBIS_SETUP.md  (richiede CMake e compilazione)
+#   Linux : sudo apt install nbis
+#   Win   : non supportato nativamente (usa WSL2 + apt install nbis)

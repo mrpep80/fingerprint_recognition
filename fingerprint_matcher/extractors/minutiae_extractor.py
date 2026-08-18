@@ -95,23 +95,59 @@ class MinutiaeExtractor(BaseExtractor):
                                      "type": "unknown", "quality": qual})
         return minutiae
 
-    # ─── OpenCV puro ─────────────────────────────────────────────────
+    # ─── OpenCV puro (cross-platform) ───────────────────────────────
 
     def _extract_opencv(self, img: np.ndarray) -> FeatureSet:
         """
-        Pipeline:
-          1. Binarizza
-          2. Scheletrizza (Zhang-Suen)
-          3. Crossing-number → minuzie grezze
-          4. Filtra spurie (bordo + prossimità)
-          5. FIX: filtra per qualità locale → top-K
+        Pipeline cross-platform — nessuna dipendenza di sistema:
+
+        STEP 0 — Binarizzazione (dal migliore al peggio):
+          a) fingerprint_enhancer (Hong-Jain, pip)  → Gabor orientato localmente,
+             qualità vicina a NBIS, funziona su Windows/macOS/Linux senza compilazione.
+          b) Binarizzazione adattiva grezza          → sempre disponibile, fallback.
+
+        Il risultato è un binary map {0,255} con creste=255 prima di skeletonize.
+
+        STEP 1 — Scheletrizza (Zhang-Suen)
+        STEP 2 — Crossing-number → minuzie grezze
+        STEP 3 — Filtra spurie (bordo + prossimità)
+        STEP 4 — Filtra per qualità locale → top-K
         """
-        binary   = self._binarize(img)
+        binary   = self._binarize_best(img)
         skeleton = self._skeletonize(binary)
         minutiae = self._crossing_number(skeleton)
         minutiae = self._filter_spurious(minutiae, skeleton)
-        minutiae = self._filter_by_quality(minutiae, img)   # ← chiave del fix
-        return self._to_featureset(minutiae, source="opencv")
+        minutiae = self._filter_by_quality(minutiae, img)
+        source   = "opencv+hong" if getattr(self, "_hong_ok", False) else "opencv"
+        return self._to_featureset(minutiae, source=source)
+
+    def _binarize_best(self, img: np.ndarray) -> np.ndarray:
+        """
+        Sceglie il miglior metodo di binarizzazione disponibile.
+
+        Priority:
+          1. fingerprint_enhancer (Hong-Jain) — portabile, qualità alta
+          2. Binarizzazione adattiva grezza   — sempre disponibile
+        """
+        if not hasattr(self, "_hong_ok"):
+            try:
+                from fingerprint_enhancer.fingerprint_image_enhancer import (
+                    enhance_fingerprint as _ef,
+                )
+                self._enhance_fn = _ef
+                self._hong_ok = True
+            except ImportError:
+                self._hong_ok = False
+
+        if self._hong_ok:
+            try:
+                # Hong-Jain: True=cresta, False=valle → converti in uint8 {0,255}
+                result = self._enhance_fn(img)
+                return result.astype(np.uint8) * 255
+            except Exception:
+                pass   # qualcosa è andato storto: usa il fallback sotto
+
+        return self._binarize(img)
 
     def _binarize(self, img: np.ndarray) -> np.ndarray:
         blurred = cv2.GaussianBlur(img, (5, 5), 0)

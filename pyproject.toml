@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "fingerprint-matcher"
+version = "5.0.0"
+description = "Fingerprint fragment matcher — cross-platform, SIFT/ORB/Minutiae/NBIS fusion"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-contrib-python>=4.5.0",
+    "numpy>=1.20.0",
+    "fingerprint-enhancer>=0.0.6",
+]
+
+[project.optional-dependencies]
+# pip install -e ".[dev]"
+dev = ["pytest", "black", "ruff"]
+
+[project.scripts]
+# Dopo 'pip install -e .' puoi usare direttamente:
+#   fingerprint-matcher frammento.jpg ./DBs/ --method fusion
+fingerprint-matcher = "fingerprint_matcher.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fingerprint_matcher*"]
+
+[tool.setuptools.package-data]
+fingerprint_matcher = ["engines/nbis/runtimes/**/*"]
